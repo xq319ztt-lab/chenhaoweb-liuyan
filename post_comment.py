@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ============================================================
@@ -34,8 +35,10 @@ SITE_ORIGIN = os.environ.get("COMMENT_SITE", "https://www.xuxuxiang.fun").rstrip
 TABLE_CSV = BASE_DIR / "comments.csv"      # 你的「称呼 + 评论」表格
 TABLE_JSON = BASE_DIR / "comments.json"    # 等价格式，两种放一个就行
 STATE_FILE = BASE_DIR / "state.json"       # 记录发到表格第几条
+SENT_LOG = BASE_DIR / "sent.log"           # 已发送记录，方便跟你的表格对账
 
 ORDER = os.environ.get("ORDER", "sequential")   # sequential=按表格顺序轮流 | random=每次随机
+LOOP = os.environ.get("LOOP", "").strip().lower() in {"1", "true", "yes"}   # 发完最后一条后是否回到开头重发
 JITTER_SECONDS = int(os.environ.get("JITTER_SECONDS", "300"))   # 随机延迟上限，0 = 不延迟
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in {"1", "true", "yes"}
 
@@ -171,23 +174,43 @@ def load_table():
     return clean
 
 
-def next_index(total_rows):
-    """返回本次要用的下标，以及发送成功后应写入的游标。"""
-    cursor = 0
+def read_state():
     if STATE_FILE.exists():
         try:
-            cursor = int(json.loads(STATE_FILE.read_text(encoding="utf-8")).get("cursor", 0))
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return int(data.get("cursor", 0)), bool(data.get("finished", False))
         except Exception:  # noqa: BLE001
-            cursor = 0
+            pass
+    return 0, False
+
+
+def save_state(cursor, finished):
+    STATE_FILE.write_text(
+        json.dumps({"cursor": cursor, "finished": finished}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def append_sent_log(position, total, name, message, created_at):
+    """追加一条发送记录，方便和你的表格逐条对账。"""
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    flat = " ".join(str(message).split())
+    with SENT_LOG.open("a", encoding="utf-8") as f:
+        f.write(f"{stamp}\t{position}/{total}\t{name}\t{flat}\t{created_at or '-'}\n")
+
+
+def next_index(total_rows):
+    """返回 (本次下标或 None, 发送成功后应写入的游标, 是否已发完)。"""
+    cursor, finished = read_state()
+
+    if not LOOP and (finished or cursor >= total_rows):
+        return None, cursor, True
 
     if ORDER == "random":
-        return random.randrange(total_rows), cursor
+        return random.randrange(total_rows), cursor, False
+
     index = cursor % total_rows
-    return index, (index + 1) % total_rows
-
-
-def save_cursor(cursor):
-    STATE_FILE.write_text(json.dumps({"cursor": cursor}, ensure_ascii=False) + "\n", encoding="utf-8")
+    return index, index + 1, (not LOOP and index + 1 >= total_rows)
 
 
 # ------------------------------------------------------------
@@ -195,7 +218,11 @@ def save_cursor(cursor):
 # ------------------------------------------------------------
 def main():
     rows = load_table()
-    index, next_cursor = next_index(len(rows))
+    index, next_cursor, finished = next_index(len(rows))
+    if index is None:
+        log(f"[完成] 表格里的 {len(rows)} 条已经全部发送完毕，本次不发任何内容。")
+        log("[完成] 想让它们从头再来一遍的话，把环境变量 LOOP 设为 true。")
+        return
     name, message = rows[index]
 
     if JITTER_SECONDS > 0 and not DRY_RUN:
@@ -235,10 +262,14 @@ def main():
     if not saved.get("id"):
         fail(f"留言没有得到确认，返回内容：{data}")
 
-    save_cursor(next_cursor)
+    save_state(next_cursor, finished)
+    append_sent_log(index + 1, len(rows), name, message, saved.get("createdAt"))
     log(f"[成功] 已发布：{saved.get('name')} / {saved.get('message')}")
     log(f"[成功] 留言时间：{saved.get('createdAt')}，留言簿总数：{data.get('total')}")
-    log(f"[成功] 下次将发送表格第 {next_cursor + 1} 条")
+    if finished:
+        log(f"[完成] 这是表格里的最后一条，{len(rows)} 条已全部发送完毕，后续不会再发。")
+    else:
+        log(f"[成功] 下次将发送表格第 {next_cursor + 1} 条")
 
 
 if __name__ == "__main__":

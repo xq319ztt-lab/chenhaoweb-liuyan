@@ -35,7 +35,9 @@ jobs:
           GUESTBOOK_API: https://www.xuxuxiang.fun/api/guestbook
           COMMENT_SITE: https://www.xuxuxiang.fun
           ORDER: sequential
-          JITTER_SECONDS: "300"
+          # 设 0：GitHub 的定时任务本身就会有几分钟的随机延迟，不需要额外 sleep。
+          # 每多 sleep 1 秒，都会算进 Actions 的免费额度消耗。
+          JITTER_SECONDS: "0"
           DRY_RUN: ${{ inputs.dry_run }}
         run: python post_comment.py
 

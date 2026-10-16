@@ -81,30 +81,41 @@ def base_headers(extra=None):
     return headers
 
 
-def call_api(method="GET", body=None):
-    """返回 (status_code, 解析后的 dict)。HTTP 错误也走正常返回，由调用方判断。"""
+def call_api(method="GET", body=None, retries=0):
+    """返回 (status_code, 解析后的 dict)。HTTP 错误也走正常返回，由调用方判断。
+
+    retries 只作用于网络层失败（连不上、握手超时）——这类失败重发是安全的。
+    服务端已经给出回应的情况（含 4xx/5xx）一律不重试。
+    """
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     headers = base_headers({"Content-Type": "application/json;charset=UTF-8"} if data else None)
-    req = urllib.request.Request(API_URL, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-            return resp.status, json.loads(raw or "{}")
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
+
+    last = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(API_URL, data=data, headers=headers, method=method)
         try:
-            payload = json.loads(raw or "{}")
-        except json.JSONDecodeError:
-            payload = {"error": raw[:300]}
-        payload["_retry_after"] = e.headers.get("Retry-After")
-        return e.code, payload
-    except Exception as e:  # noqa: BLE001
-        return 0, {"error": f"请求异常：{e!r}"}
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+                return resp.status, json.loads(raw or "{}")
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            try:
+                payload = json.loads(raw or "{}")
+            except json.JSONDecodeError:
+                payload = {"error": raw[:300]}
+            payload["_retry_after"] = e.headers.get("Retry-After")
+            return e.code, payload
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < retries:
+                log(f"[提示] 第 {attempt + 1} 次请求没连上（{e!r}），3 秒后重试")
+                time.sleep(3)
+    return 0, {"error": f"请求异常：{last!r}"}
 
 
 def fetch_guestbook():
-    """GET 留言簿，返回 (token, 已有的留言列表, 总数)。"""
-    status, data = call_api("GET")
+    """GET 留言簿，返回 (token, 已有的留言列表, 总数)。纯读操作，允许重试。"""
+    status, data = call_api("GET", retries=3)
     if status != 200 or not isinstance(data.get("token"), str):
         fail(f"读取留言簿失败（HTTP {status}）：{data.get('error', data)}")
     messages = data.get("messages") or []

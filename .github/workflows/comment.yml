@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: guestbook-bot
@@ -50,7 +51,36 @@ jobs:
           fi
           git config user.name "guestbook-bot"
           git config user.email "guestbook-bot@users.noreply.github.com"
-          touch sent.log
-          git add state.json sent.log
-          git commit -m "progress: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "无变更"
-          git push
+          git add state.json
+          if [ -f sent.log ]; then
+            git add sent.log
+          fi
+          if git diff --cached --quiet; then
+            echo "进度没有变化，不产生提交"
+            exit 0
+          fi
+          git commit -m "progress: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if git push; then
+            echo "进度已回写"
+          else
+            echo "推送失败，先同步远端再推一次"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || echo "同步远端失败"
+            git push || echo "进度这次没能回写。脚本下次会先查重，不会重复留言。"
+          fi
+
+      - name: 全部发完后自动停用本工作流（避免空转）
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f state.json ]; then
+            exit 0
+          fi
+          FINISHED=$(python -c "import json;print('true' if json.load(open('state.json')).get('finished') else 'false')" 2>/dev/null || echo false)
+          if [ "$FINISHED" != "true" ]; then
+            exit 0
+          fi
+          echo "表格里的留言已全部发送完毕，停用本工作流。"
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/comment.yml/disable" \
+            && echo "已停用。以后想再跑，到 Actions 页面点 Enable workflow 即可。" \
+            || echo "自动停用没成功（不影响结果：脚本本身已经不会再发任何内容）"

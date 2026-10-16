@@ -174,6 +174,21 @@ def load_table():
     return clean
 
 
+def normalize(text):
+    """把文本压成可比较的形式：合并多余空白、统一大小写。"""
+    return " ".join(str(text or "").split()).casefold()
+
+
+def already_on_board(messages, name, message):
+    """在留言板返回的列表里查有没有一模一样的「称呼 + 内容」。
+    查到就说明上一次其实发送成功了、只是进度没回写，返回它的发布时间。"""
+    target = (normalize(name), normalize(message))
+    for item in messages:
+        if (normalize(item.get("name")), normalize(item.get("message"))) == target:
+            return item.get("createdAt") or "时间未知"
+    return None
+
+
 def read_state():
     if STATE_FILE.exists():
         try:
@@ -238,7 +253,20 @@ def main():
         log("[预览] DRY_RUN 已开启，不实际发送，也不推进进度")
         return
 
-    token, _, _ = fetch_guestbook()
+    token, messages, total = fetch_guestbook()
+
+    # 查重保险：万一上次「发送成功了但进度没回写」（比如推送失败），
+    # 这次直接跳过，只补记进度，绝对不发第二遍。
+    if not LOOP:
+        hit = already_on_board(messages, name, message)
+        if hit:
+            log(f"[跳过] 这条其实已经在留言板上了（{hit}）。")
+            log("[跳过] 上次发送成功但进度没回写，本次只补记进度，不重复发送。")
+            save_state(next_cursor, finished)
+            append_sent_log(index + 1, len(rows), name, message, hit)
+            return
+        if total > len(messages):
+            log(f"[信息] 留言板共 {total} 条，本次用于查重的是最近 {len(messages)} 条。")
 
     status, data = submit(name, message, token)
 

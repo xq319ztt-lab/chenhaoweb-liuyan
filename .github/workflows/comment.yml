@@ -1,0 +1,53 @@
+name: guestbook-bot
+
+on:
+  schedule:
+    # 每 30 分钟跑一次（cron 用 UTC 时间；GitHub 最短支持 5 分钟间隔）
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只预览不发（勾选后不会真的发留言）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: guestbook-bot
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 发送一条留言
+        env:
+          GUESTBOOK_API: https://www.xuxuxiang.fun/api/guestbook
+          COMMENT_SITE: https://www.xuxuxiang.fun
+          ORDER: sequential
+          JITTER_SECONDS: "300"
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: python post_comment.py
+
+      - name: 回写进度（同时让仓库保持活跃，避免定时任务被停用）
+        if: always()
+        run: |
+          if [ ! -f state.json ]; then
+            echo "本次没有推进进度，无需回写"
+            exit 0
+          fi
+          git config user.name "guestbook-bot"
+          git config user.email "guestbook-bot@users.noreply.github.com"
+          git add state.json
+          git commit -m "progress: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "无变更"
+          git push

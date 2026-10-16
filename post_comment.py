@@ -190,14 +190,27 @@ def normalize(text):
     return " ".join(str(text or "").split()).casefold()
 
 
-def already_on_board(messages, name, message):
-    """在留言板返回的列表里查有没有一模一样的「称呼 + 内容」。
-    查到就说明上一次其实发送成功了、只是进度没回写，返回它的发布时间。"""
-    target = (normalize(name), normalize(message))
+def resume_from_board(rows, messages):
+    """用留言板反推真实进度。
+
+    返回 (应该从第几条继续的下标, {已发过的下标: 发布时间})。
+
+    为什么需要它：state.json 只存在仓库里，一旦回写失败（比如仓库没给
+    写权限、或推送冲突），进度就会永远停在原地——那时如果只用「这条发过
+    就跳过」的查重逻辑，脚本会卡在第 1 条反复空转，一条也发不出去。
+    留言板本身才是唯一可靠的进度账本，所以这里直接对着它算。
+    """
+    on_board = {}
     for item in messages:
-        if (normalize(item.get("name")), normalize(item.get("message"))) == target:
-            return item.get("createdAt") or "时间未知"
-    return None
+        key = (normalize(item.get("name")), normalize(item.get("message")))
+        on_board.setdefault(key, item.get("createdAt") or "时间未知")
+
+    sent = {}
+    for i, (name, message) in enumerate(rows):
+        if (normalize(name), normalize(message)) in on_board:
+            sent[i] = on_board[(normalize(name), normalize(message))]
+
+    return (max(sent) + 1) if sent else 0, sent
 
 
 def read_state():
@@ -266,18 +279,31 @@ def main():
 
     token, messages, total = fetch_guestbook()
 
-    # 查重保险：万一上次「发送成功了但进度没回写」（比如推送失败），
-    # 这次直接跳过，只补记进度，绝对不发第二遍。
+    # 对着留言板核对真实进度：查重和纠偏一次搞定。
+    # 如果这一条（或更靠后的若干条）已经在板上，说明之前发成功了但进度没记上，
+    # 直接跳到实际该发的位置——既不重复，也不会卡在第 1 条空转。
     if not LOOP:
-        hit = already_on_board(messages, name, message)
-        if hit:
-            log(f"[跳过] 这条其实已经在留言板上了（{hit}）。")
-            log("[跳过] 上次发送成功但进度没回写，本次只补记进度，不重复发送。")
-            save_state(next_cursor, finished)
-            append_sent_log(index + 1, len(rows), name, message, hit)
-            return
+        real, sent = resume_from_board(rows, messages)
+        if real > index:
+            skipped = [i for i in sorted(sent) if index <= i < real]
+            if skipped:
+                log("[纠偏] 留言板上已经有第 " + "、".join(str(i + 1) for i in skipped)
+                    + " 条，跳过不重发。")
+                for i in skipped:
+                    append_sent_log(i + 1, len(rows), rows[i][0], rows[i][1], sent[i])
+            index = real
+            if index >= len(rows):
+                save_state(index, True)
+                log(f"[完成] 表格里的 {len(rows)} 条已经全部发送完毕，本次不发任何内容。")
+                return
+            name, message = rows[index]
+            next_cursor = index + 1
+            finished = index + 1 >= len(rows)
+            log(f"[信息] 本次发送第 {index + 1}/{len(rows)} 条")
+            log(f"[信息] 称呼：{name}")
+            log(f"[信息] 评论：{message}")
         if total > len(messages):
-            log(f"[信息] 留言板共 {total} 条，本次用于查重的是最近 {len(messages)} 条。")
+            log(f"[信息] 留言板共 {total} 条，本次用于核对的是最近 {len(messages)} 条。")
 
     status, data = submit(name, message, token)
 
